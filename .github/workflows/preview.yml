@@ -1,0 +1,93 @@
+name: Preview Deployment
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+env:
+  GCP_REGION: us-west1
+
+jobs:
+  preview:
+    name: Deploy Preview
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.draft == false
+
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@v2
+      with:
+        credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+    - name: Set up Cloud SDK
+      uses: google-github-actions/setup-gcloud@v2
+      with:
+        project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+    - name: Configure Docker for Artifact Registry
+      run: |
+        gcloud auth configure-docker ${{ env.GCP_REGION }}-docker.pkg.dev
+
+    - name: Build and deploy preview backend
+      id: deploy-backend-preview
+      run: |
+        # Generate preview service names
+        PREVIEW_BACKEND="preview-backend-pr-${{ github.event.pull_request.number }}"
+
+        # Build and push backend
+        docker build -t ${{ env.GCP_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/steenfuentes/${PREVIEW_BACKEND}:${{ github.sha }} ./backend
+        docker push ${{ env.GCP_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/steenfuentes/${PREVIEW_BACKEND}:${{ github.sha }}
+
+        # Deploy backend
+        gcloud run deploy ${PREVIEW_BACKEND} \
+          --image=${{ env.GCP_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/steenfuentes/${PREVIEW_BACKEND}:${{ github.sha }} \
+          --region=${{ env.GCP_REGION }} \
+          --allow-unauthenticated \
+          --set-env-vars="ENVIRONMENT=preview,AUTH_ENABLED=false" \
+          --max-instances=2
+
+        # Get backend URL
+        BACKEND_URL=$(gcloud run services describe ${PREVIEW_BACKEND} --region=${{ env.GCP_REGION }} --format='value(status.url)')
+        echo "backend_url=$BACKEND_URL" >> $GITHUB_OUTPUT
+        echo "backend_service=$PREVIEW_BACKEND" >> $GITHUB_OUTPUT
+
+    - name: Build and deploy preview frontend
+      id: deploy-frontend-preview
+      run: |
+        # Generate preview service name
+        PREVIEW_FRONTEND="preview-frontend-pr-${{ github.event.pull_request.number }}"
+
+        # Build and push frontend
+        cd frontend
+        docker build \
+          --build-arg VITE_API_URL=${{ steps.deploy-backend-preview.outputs.backend_url }}/api \
+          -t ${{ env.GCP_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/steenfuentes/${PREVIEW_FRONTEND}:${{ github.sha }} \
+          .
+        docker push ${{ env.GCP_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/steenfuentes/${PREVIEW_FRONTEND}:${{ github.sha }}
+
+        # Deploy frontend
+        gcloud run deploy ${PREVIEW_FRONTEND} \
+          --image=${{ env.GCP_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/steenfuentes/${PREVIEW_FRONTEND}:${{ github.sha }} \
+          --region=${{ env.GCP_REGION }} \
+          --allow-unauthenticated \
+          --set-env-vars="VITE_API_URL=${{ steps.deploy-backend-preview.outputs.backend_url }}/api" \
+          --max-instances=2
+
+        # Get frontend URL
+        FRONTEND_URL=$(gcloud run services describe ${PREVIEW_FRONTEND} --region=${{ env.GCP_REGION }} --format='value(status.url)')
+        echo "frontend_url=$FRONTEND_URL" >> $GITHUB_OUTPUT
+        echo "frontend_service=$PREVIEW_FRONTEND" >> $GITHUB_OUTPUT
+
+    - name: Comment PR with preview URLs
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const script = require('./.github/workflows/preview-pr-comment.js')
+          await script({github, context, core, previewFrontendUrl: ${{ steps.deploy-frontend-preview.outputs.frontend_url }}, previewBackendUrl: ${{ steps.deploy-backend-preview.outputs.backend_url }}})
